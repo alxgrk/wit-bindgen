@@ -92,6 +92,7 @@ jobs:
     - run: cargo build --no-default-features --features go
     - run: cargo build --no-default-features --features csharp
     - run: cargo build --no-default-features --features markdown
+    - run: cargo build --no-default-features --features kotlin
 
 
   rustfmt:

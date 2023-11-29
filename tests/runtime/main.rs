@@ -2,7 +2,6 @@ use anyhow::Result;
 use heck::ToUpperCamelCase;
 
 use std::borrow::Cow;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
@@ -124,6 +123,7 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
     let mut rust = Vec::new();
     let mut c = Vec::new();
     let mut java = Vec::new();
+    let mut kotlin = Vec::new();
     let mut go = Vec::new();
     let mut c_sharp: Vec<PathBuf> = Vec::new();
     for file in dir.read_dir()? {
@@ -131,6 +131,7 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
         match path.extension().and_then(|s| s.to_str()) {
             Some("c") => c.push(path),
             Some("java") => java.push(path),
+            Some("kt") => kotlin.push(path),
             Some("rs") => rust.push(path),
             Some("go") => go.push(path),
             Some("cs") => {
@@ -711,6 +712,99 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
                 out_wasm
             ));
         let component_path = out_wasm.with_extension("component.wasm");
+        fs::write(&component_path, component).expect("write component to disk");
+
+        result.push(component_path);
+    }
+
+    #[cfg(feature = "kotlin")]
+    if !kotlin.is_empty() {
+        use heck::*;
+
+        let world_name = &resolve.worlds[world].name;
+        let out_dir = out_dir.join(format!("kotlin-{}", world_name));
+        drop(fs::remove_dir_all(&out_dir));
+        let kotlin_dir = out_dir.join("src/wasmJsMain/kotlin");
+        let mut files = Default::default();
+
+        wit_bindgen_kotlin::Opts::default()
+            .build()
+            .generate(&resolve, world, &mut files)
+            .unwrap();
+
+        let package_dir = kotlin_dir.join(&format!("wit.worlds"));
+        fs::create_dir_all(&package_dir).unwrap();
+        for (file, contents) in files.iter() {
+            let dst = package_dir.join(file);
+            fs::write(dst, contents).unwrap();
+        }
+
+        let kebab = format!("kotlin-{}", world_name.to_kebab_case());
+        for kotlin_impl in kotlin {
+            fs::copy(
+                &kotlin_impl,
+                &package_dir.join(kotlin_impl.file_name().unwrap()),
+            )
+                .unwrap();
+        }
+
+        fs::write(
+            &out_dir.join("build.gradle.kts"),
+            include_bytes!("../../crates/kotlin/tests/build.gradle.kts"),
+        )
+            .unwrap();
+        fs::write(
+            &kotlin_dir.join("Main.kt"),
+            include_bytes!("../../crates/kotlin/tests/Main.kt"),
+        )
+            .unwrap();
+
+        let mut cmd = Command::new("gradle");
+        cmd.arg("-p")
+            .arg(&out_dir)
+            .arg("build");
+
+        println!("{cmd:?}");
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(e) => panic!("failed to run gradle build: {}", e),
+        };
+
+        if !output.status.success() {
+            println!("status: {}", output.status);
+            println!("stdout: ------------------------------------------");
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            println!("stderr: ------------------------------------------");
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("failed to build");
+        }
+
+        let out_wasm = out_dir.join(format!("build/js/packages/{kebab}-wasm-js/kotlin/{kebab}-wasm-js.wasm"));
+
+        // Translate the canonical ABI module into a component.
+        let mut module = fs::read(&out_wasm).expect("failed to read wasm file");
+        // TODO encode to custom section until Kotlin is able to do that by itself
+        let encoded = wit_component::metadata::encode(&resolve, world, StringEncoding::UTF8, None, None)?;
+
+        let section = wasm_encoder::CustomSection {
+            name: Cow::Borrowed("component-type"),
+            data: Cow::Borrowed(&encoded),
+        };
+        module.push(section.id());
+        section.encode(&mut module);
+
+        let component = ComponentEncoder::default()
+            .module(module.as_slice())
+            .expect("pull custom sections from module")
+            .validate(true)
+            .adapter("wasi_snapshot_preview1", &wasi_adapter)
+            .expect("adapter failed to get loaded")
+            .encode()
+            .expect(&format!(
+                "module {out_wasm:?} can not be translated to a component",
+            ));
+        let component_path =
+            out_dir.join(format!("build/js/packages/{kebab}-wasm-js/kotlin/{kebab}-wasm-js.component.wasm"));
         fs::write(&component_path, component).expect("write component to disk");
 
         result.push(component_path);
